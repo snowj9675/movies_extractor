@@ -1,6 +1,16 @@
 """
-moviehdtv.com / moviedbhub.com — detail scraper (v5)
+moviehdtv.com / moviedbhub.com — detail scraper (v6)
 ------------------------------------------------------
+Changes from v5:
+  - sanitize_text() applied to ALL scraped string fields (prevents raw text
+    injection that caused "honest government officer..." JSON corruption)
+  - Per-record json.dumps() validation in process() before writing to result_map
+  - save_json() uses ensure_ascii=True (escapes all non-ASCII as \\uXXXX)
+  - Unicode NFC normalization + control-char stripping in sanitize_text()
+  - sanitize_text() applied to download label, quality_group, and all info fields
+  - download append() now sanitizes url and label before storing
+  - synopsis, categories, cast, and all free-text fields go through sanitizer
+
 Keyword-targeted parsing strategy:
   The site has TWO info block formats depending on page type:
 
@@ -29,7 +39,14 @@ Keyword-targeted parsing strategy:
   Both moviehdtv.com and moviedbhub.com use the same template.
 """
 
-import json, os, re, random, sys, time, threading
+import json
+import os
+import re
+import random
+import sys
+import time
+import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,33 +70,35 @@ TIME_LIMIT_SECS = 17700   # 295 min for GitHub Actions
 # Keyword map: every possible label → unified field name
 # Covers both <strong> and <b> variants, with/without colon
 INFO_KEYWORD_MAP = {
-    "movie name":       "movie_name",
-    "web-series name":  "movie_name",
-    "series name":      "movie_name",
-    "show name":        "movie_name",
-    "release year":     "release_year",
-    "format":           "format",
-    "size":             "size",
-    "original language":"original_lang",
-    "quality":          "quality",
-    "genres":           "genres",
-    "genre":            "genres",
-    "cast":             "cast",
-    "season":           "season",
-    "episodes":         "episodes",
-    "imdb rating":      "imdb_rating",
+    "movie name":        "movie_name",
+    "web-series name":   "movie_name",
+    "series name":       "movie_name",
+    "show name":         "movie_name",
+    "release year":      "release_year",
+    "format":            "format",
+    "size":              "size",
+    "original language": "original_lang",
+    "quality":           "quality",
+    "genres":            "genres",
+    "genre":             "genres",
+    "cast":              "cast",
+    "season":            "season",
+    "episodes":          "episodes",
+    "imdb rating":       "imdb_rating",
 }
 
 # Quality resolution keywords used to identify h3 headings in STYLE B
 QUALITY_KEYWORDS = re.compile(
     r"\b(4k|2160p|1080p|720p|480p|360p|240p|hdtc|hdrip|webrip|web-dl|bdrip|dvdrip|hevc|x264|x265)\b",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 SKIP_IMG_WORDS  = {"logo", "favicon", "emoji", "avatar", "banner", "templates"}
-KNOWN_CDN_HOSTS = {"nexdrive", "gdrive", "drive.google", "mega.nz", "mediafire",
-                   "pixeldrain", "1fichier", "gofile", "buzzheavier", "hubcloud",
-                   "driveseed", "filepress", "send.cm", "uploadhaven"}
+KNOWN_CDN_HOSTS = {
+    "nexdrive", "gdrive", "drive.google", "mega.nz", "mediafire",
+    "pixeldrain", "1fichier", "gofile", "buzzheavier", "hubcloud",
+    "driveseed", "filepress", "send.cm", "uploadhaven",
+}
 
 HEADERS = {
     "User-Agent": (
@@ -94,6 +113,40 @@ _start_time = time.monotonic()
 _stop_flag  = threading.Event()
 _local      = threading.local()
 
+
+# ── Text sanitizer (prevents JSON injection from raw scraped text) ─────────────
+
+def sanitize_text(value) -> str:
+    """
+    Cleans a scraped string so it is always safe to embed in JSON:
+      - Coerces to str
+      - Strips null bytes and non-printable control chars (keeps \\t \\n \\r)
+      - Normalizes unicode to NFC (avoids ambiguous multi-byte sequences)
+      - Collapses all internal whitespace runs to a single space
+      - Strips leading/trailing whitespace
+    This prevents raw synopsis/label text from bleeding across JSON field
+    boundaries (as seen with the "honest government officer..." corruption).
+    """
+    if not isinstance(value, str):
+        value = str(value) if value is not None else ""
+    # NFC normalization — resolves ambiguous Unicode lookalike characters
+    value = unicodedata.normalize("NFC", value)
+    # Remove null bytes and C0/C1 control chars except tab(9), LF(10), CR(13)
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]", "", value)
+    # Collapse all whitespace (including newlines inside a field) to one space
+    value = re.sub(r"[ \t\r\n]+", " ", value).strip()
+    return value
+
+
+def sanitize_url(value) -> str:
+    """Minimal URL sanitizer — strip whitespace and control chars only."""
+    if not isinstance(value, str):
+        return ""
+    value = re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
+    return value
+
+
+# ── Session / IO helpers ──────────────────────────────────────────────────────
 
 def get_session():
     if not hasattr(_local, "session"):
@@ -115,9 +168,14 @@ def load_json(path, default):
 
 
 def save_json(path, data):
+    """
+    Saves JSON with ensure_ascii=True so every non-ASCII character is stored
+    as a \\uXXXX escape sequence, guaranteeing a pure ASCII-safe JSON file and
+    eliminating 'ambiguous unicode character' warnings from validators.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=True, indent=2)
     os.replace(tmp, path)
 
 
@@ -181,14 +239,15 @@ def extract_info(soup) -> dict:
     """
     Tries both FORMAT A (<strong>) and FORMAT B (<b> / plain text).
     Returns a flat dict keyed by our unified field names.
+    All values are passed through sanitize_text() before storage.
     """
     info = {}
 
     def store(raw_key, raw_value):
-        key = raw_key.lower().strip().rstrip(":")
+        key   = sanitize_text(raw_key).lower().rstrip(":")
         field = INFO_KEYWORD_MAP.get(key)
         if field and raw_value and field not in info:
-            info[field] = raw_value.strip()
+            info[field] = sanitize_text(raw_value)
 
     # FORMAT A — <strong>Key:</strong> value as next sibling
     for tag in soup.find_all("strong"):
@@ -204,7 +263,6 @@ def extract_info(soup) -> dict:
         sib = tag.next_sibling
         if sib:
             val = (sib if isinstance(sib, str) else sib.get_text()).strip()
-            # strip leading colon/space from sibling text
             val = val.lstrip(":").strip()
             store(raw_key, val)
 
@@ -225,28 +283,36 @@ def extract_info(soup) -> dict:
 # ── Download link parser ──────────────────────────────────────────────────────
 
 def extract_downloads(soup) -> list:
-    downloads = []
+    downloads  = []
     seen_urls: set = set()
 
     def append(quality_group, a_tag):
-        url = a_tag.get("href", "").strip()
+        url = sanitize_url(a_tag.get("href", ""))
         if not url or url in seen_urls or url.startswith("#"):
             return
         # Only keep actual download links, not internal nav links
-        if not any(cdn in url for cdn in KNOWN_CDN_HOSTS) and \
-           "moviehdtv.com" not in url and "moviedbhub.com" not in url:
-            # Accept any external link that isn't the same domain
+        if not any(cdn in url for cdn in KNOWN_CDN_HOSTS):
             if url.startswith("http") and \
                "moviehdtv.com" not in url and "moviedbhub.com" not in url:
                 pass  # external = likely a download
             else:
                 return
         seen_urls.add(url)
-        label = a_tag.get_text(" ", strip=True)
-        res   = (re.search(r"\b(4[Kk]|2160p|1080p|720p|480p|360p|240p)\b", label) or [None, None])[1]
-        sz    = (re.search(r"(\d+(?:\.\d+)?\s*(?:MB|GB|KB))", label, re.I) or [None, None])[1]
+
+        # Sanitize label — this is the field that caused the v5 corruption:
+        # a_tag spanning multiple DOM nodes could return huge text blobs
+        label = sanitize_text(a_tag.get_text(" ", strip=True))
+
+        # Sanitize quality_group too (comes from h3 text)
+        q_group = sanitize_text(quality_group) if quality_group else None
+
+        res = (re.search(r"\b(4[Kk]|2160p|1080p|720p|480p|360p|240p)\b", label)
+               or [None, None])[1]
+        sz  = (re.search(r"(\d+(?:\.\d+)?\s*(?:MB|GB|KB))", label, re.I)
+               or [None, None])[1]
+
         downloads.append({
-            "quality_group": quality_group,
+            "quality_group": q_group,
             "resolution":    res,
             "size":          sz.replace(" ", "") if sz else None,
             "label":         label,
@@ -262,11 +328,11 @@ def extract_downloads(soup) -> list:
                 span = tag.find("span")
                 a    = tag.find("a")
                 if span and not a:
-                    current_q = span.get_text(strip=True)
+                    current_q = sanitize_text(span.get_text(strip=True))
                 elif a:
                     append(current_q, a)
                 elif QUALITY_KEYWORDS.search(tag.get_text()):
-                    current_q = tag.get_text(strip=True)
+                    current_q = sanitize_text(tag.get_text(strip=True))
             else:
                 for a in tag.find_all("a", href=True):
                     append(current_q, a)
@@ -276,15 +342,12 @@ def extract_downloads(soup) -> list:
     if not downloads:
         current_q = None
         for tag in soup.find_all("h3"):
-            a = tag.find("a", href=True)
+            a    = tag.find("a", href=True)
             text = tag.get_text(strip=True)
             if a:
-                # This h3 has a link — it's a download entry
                 append(current_q, a)
             elif QUALITY_KEYWORDS.search(text):
-                # This h3 is a quality heading
-                current_q = text
-            # else: some other h3, ignore
+                current_q = sanitize_text(text)
 
     # STYLE C — last resort: any external <a> pointing to CDN
     if not downloads:
@@ -308,45 +371,51 @@ def parse(html, base) -> dict:
         k in info for k in ["season", "episodes"]
     ) or "season" in base.get("href", "").lower() else "movie"
 
-    # synopsis
+    # synopsis — sanitized to prevent multi-paragraph bleed into the field
     synopsis = ""
-    h3 = soup.find(lambda t: t.name == "h3" and t.get_text() and
-                   "SYNOPSIS" in t.get_text().upper())
+    h3 = soup.find(
+        lambda t: t.name == "h3" and t.get_text() and
+        "SYNOPSIS" in t.get_text().upper()
+    )
     if h3:
         p = h3.find_next("p")
-        if p: synopsis = p.get_text(strip=True)
+        if p:
+            synopsis = sanitize_text(p.get_text(strip=True))
 
     # screenshots — images below the cover in article body
-    cover = base.get("image", "")
+    cover       = base.get("image", "")
     screenshots = []
     for img in soup.find_all("img"):
         src = abs_img(img.get("src", ""))
         if not src or src == cover: continue
         if any(w in src.lower() for w in SKIP_IMG_WORDS): continue
-        # only posts/covers or uploads paths — skip template/UI images
         if "/uploads/" in src or "/posts/" in src:
             if src not in screenshots:
-                screenshots.append(src)
+                screenshots.append(sanitize_url(src))
 
     # downloads
     downloads = extract_downloads(soup)
 
     # watch online
     watch_online = None
-    for sel in ["#IndStreamPlayer iframe", ".stream-player iframe",
-                ".online-player iframe", "iframe[src*='player']",
-                "iframe[src*='embed']", "iframe[src*='stream']"]:
+    for sel in [
+        "#IndStreamPlayer iframe", ".stream-player iframe",
+        ".online-player iframe", "iframe[src*='player']",
+        "iframe[src*='embed']", "iframe[src*='stream']",
+    ]:
         iframe = soup.select_one(sel)
         if iframe:
-            watch_online = iframe.get("src") or iframe.get("data-src")
-            if watch_online: break
+            raw_src = iframe.get("src") or iframe.get("data-src")
+            if raw_src:
+                watch_online = sanitize_url(raw_src)
+                break
 
     # categories — internal nav links in article paragraphs
     categories = []
     for p in soup.select("article p, .post-content p, div.full-text p"):
         for a in p.find_all("a", href=True):
             href_a = a["href"]
-            t = a.get_text(strip=True)
+            t      = sanitize_text(a.get_text(strip=True))
             if not t or t in {"HdMovieHub", "HdMovieHub.You"}: continue
             if "moviehdtv.com" in href_a or "moviedbhub.com" in href_a:
                 if t not in categories:
@@ -355,39 +424,54 @@ def parse(html, base) -> dict:
 
     # genres — split from info
     genres_raw = info.get("genres", "")
-    genres = [g.strip() for g in re.split(r"[,/|]", genres_raw) if g.strip()]
+    genres = [
+        sanitize_text(g)
+        for g in re.split(r"[,/|]", genres_raw)
+        if g.strip()
+    ]
 
     # quality fallback from downloads
     quality = info.get("quality", "")
     if not quality and downloads:
         qs = [d["resolution"] for d in downloads if d.get("resolution")]
         if qs:
-            quality = " / ".join(sorted(set(qs),
-                key=lambda x: int(re.sub(r"\D", "", x) or 0), reverse=True))
+            quality = " / ".join(
+                sorted(set(qs),
+                       key=lambda x: int(re.sub(r"\D", "", x) or 0),
+                       reverse=True)
+            )
 
     # title
-    real_title = base.get("title", "")
+    real_title = sanitize_text(base.get("title", ""))
     h1 = soup.select_one("h1.post-title, h1.entry-title, article h1, h1")
-    if h1: real_title = h1.get_text(strip=True)
+    if h1:
+        real_title = sanitize_text(h1.get_text(strip=True))
     if not real_title:
         og = soup.find("meta", property="og:title")
-        if og: real_title = og.get("content", "").replace(" - HdMovieHub", "").strip()
+        if og:
+            real_title = sanitize_text(
+                og.get("content", "").replace(" - HdMovieHub", "").strip()
+            )
 
     # cover
-    real_cover = base.get("image", "")
+    real_cover = sanitize_url(base.get("image", ""))
     if not real_cover:
         og_img = soup.find("meta", property="og:image")
-        if og_img: real_cover = og_img.get("content", "").strip()
+        if og_img:
+            real_cover = sanitize_url(og_img.get("content", "").strip())
 
     # date
-    real_date = base.get("date", "")
+    real_date = sanitize_text(base.get("date", ""))
     if not real_date:
         t = soup.select_one("time, .date-time span, .post-date")
-        if t: real_date = t.get("datetime") or t.get_text(strip=True)
+        if t:
+            real_date = sanitize_text(
+                t.get("datetime") or t.get_text(strip=True)
+            )
 
     return {
         "id":            slug(base["href"]),
-        "href":          base["href"],
+        "href":          sanitize_url(base["href"]),
         "title":         real_title,
         "cover_image":   real_cover,
         "date_posted":   real_date,
@@ -418,19 +502,47 @@ def parse(html, base) -> dict:
 
 def process(base) -> dict:
     movie_id = slug(base["href"])
+
     if _stop_flag.is_set():
-        return {**base, "id": movie_id, "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "detail_error": "skipped_time_limit"}
+        return {
+            **base, "id": movie_id,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "detail_error": "skipped_time_limit",
+        }
+
     html = fetch(base["href"])
     if html is None:
         err = "fetch_failed" if not _stop_flag.is_set() else "skipped_time_limit"
-        return {**base, "id": movie_id, "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "detail_error": err}
+        return {
+            **base, "id": movie_id,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "detail_error": err,
+        }
+
     try:
-        return parse(html, base)
+        result = parse(html, base)
+
+        # ── Per-record JSON validation ─────────────────────────────────────
+        # Attempt to serialize the record NOW, before it enters result_map.
+        # Any field that would corrupt the output file raises here instead,
+        # so the bad record is logged with detail_error and skipped cleanly.
+        try:
+            json.dumps(result, ensure_ascii=True)
+        except (ValueError, TypeError) as json_err:
+            return {
+                **base, "id": movie_id,
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "detail_error": f"json_invalid: {json_err}",
+            }
+
+        return result
+
     except Exception as e:
-        return {**base, "id": movie_id, "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "detail_error": f"parse_error: {e}"}
+        return {
+            **base, "id": movie_id,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "detail_error": f"parse_error: {e}",
+        }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -439,18 +551,26 @@ def main():
     global _start_time
     _start_time = time.monotonic()
 
-    existing    = load_json(OUTPUT_FILE, [])
-    result_map  = {r["id"]: r for r in existing if "id" in r}
+    existing   = load_json(OUTPUT_FILE, [])
+    result_map = {r["id"]: r for r in existing if "id" in r}
 
     rescrape_list = load_json(RESCRAPE_FILE, None)
 
     if rescrape_list is not None:
-        print(f"[INFO] TARGETED MODE — {len(rescrape_list)} URLs from {RESCRAPE_FILE}", flush=True)
-        todo = [{"href": m["href"], "title": result_map.get(slug(m["href"]), {}).get("title",""),
-                 "image": result_map.get(slug(m["href"]), {}).get("cover_image",""),
-                 "date": result_map.get(slug(m["href"]), {}).get("date_posted",""),
-                 "page": result_map.get(slug(m["href"]), {}).get("page", 0)}
-                for m in rescrape_list]
+        print(
+            f"[INFO] TARGETED MODE — {len(rescrape_list)} URLs from {RESCRAPE_FILE}",
+            flush=True,
+        )
+        todo = [
+            {
+                "href":  m["href"],
+                "title": result_map.get(slug(m["href"]), {}).get("title", ""),
+                "image": result_map.get(slug(m["href"]), {}).get("cover_image", ""),
+                "date":  result_map.get(slug(m["href"]), {}).get("date_posted", ""),
+                "page":  result_map.get(slug(m["href"]), {}).get("page", 0),
+            }
+            for m in rescrape_list
+        ]
         done_ids = set()  # always re-scrape all listed
     else:
         movies   = fetch_movies_list()
@@ -459,7 +579,7 @@ def main():
         todo     = [m for m in movies if slug(m["href"]) not in done_ids]
 
     total = len(todo)
-    print(f"[INFO] To scrape:   {total}", flush=True)
+    print(f"[INFO] To scrape:   {total}",         flush=True)
     print(f"[INFO] In output:   {len(result_map)}", flush=True)
     print(f"[INFO] Time limit:  {fmt_time(TIME_LIMIT_SECS)}", flush=True)
 
@@ -478,7 +598,10 @@ def main():
     def watcher():
         while not _stop_flag.is_set():
             if elapsed() >= TIME_LIMIT_SECS - 60:
-                print(f"\n[WARN] Time limit at {fmt_time(elapsed())} — draining …", flush=True)
+                print(
+                    f"\n[WARN] Time limit at {fmt_time(elapsed())} — draining …",
+                    flush=True,
+                )
                 _stop_flag.set()
                 return
             time.sleep(5)
@@ -493,10 +616,13 @@ def main():
             try:
                 detail = future.result()
             except Exception as exc:
-                base = futures[future]
-                detail = {**base, "id": slug(base["href"]),
-                          "scraped_at": datetime.now(timezone.utc).isoformat(),
-                          "detail_error": f"exception: {exc}"}
+                base   = futures[future]
+                detail = {
+                    **base,
+                    "id":          slug(base["href"]),
+                    "scraped_at":  datetime.now(timezone.utc).isoformat(),
+                    "detail_error": f"exception: {exc}",
+                }
 
             movie_id = detail.get("id", "")
             err      = detail.get("detail_error")
@@ -504,18 +630,25 @@ def main():
             with save_lock:
                 result_map[movie_id] = detail
                 done_ids.add(movie_id)
-                if not err:                        completed += 1
-                elif "skipped" in (err or ""):     skipped   += 1
-                else:                              errors    += 1
+                if not err:
+                    completed += 1
+                elif "skipped" in (err or ""):
+                    skipped   += 1
+                else:
+                    errors    += 1
                 pending[0] += 1
                 if pending[0] >= SAVE_EVERY:
-                    do_save(); pending[0] = 0
+                    do_save()
+                    pending[0] = 0
                 total_done = completed + errors + skipped
                 if total_done % LOG_EVERY == 0 or total_done == total:
                     pct = total_done / total * 100
-                    print(f"[{fmt_time(elapsed())}] {total_done}/{total} ({pct:.1f}%)  "
-                          f"ok={completed} err={errors} skip={skipped} "
-                          f"out={len(result_map)}", flush=True)
+                    print(
+                        f"[{fmt_time(elapsed())}] {total_done}/{total} ({pct:.1f}%)  "
+                        f"ok={completed} err={errors} skip={skipped} "
+                        f"out={len(result_map)}",
+                        flush=True,
+                    )
 
             if _stop_flag.is_set() and skipped > 0:
                 break
@@ -524,12 +657,18 @@ def main():
         do_save()
 
     _stop_flag.set()
-    print(f"\n[DONE] {fmt_time(elapsed())}  ok={completed} err={errors} skip={skipped}", flush=True)
+    print(
+        f"\n[DONE] {fmt_time(elapsed())}  ok={completed} err={errors} skip={skipped}",
+        flush=True,
+    )
     print(f"       Total in output: {len(result_map)}", flush=True)
 
     if rescrape_list is not None and skipped == 0:
         Path(RESCRAPE_FILE).unlink(missing_ok=True)
-        print(f"[INFO] Removed {RESCRAPE_FILE} — targeted re-scrape complete", flush=True)
+        print(
+            f"[INFO] Removed {RESCRAPE_FILE} — targeted re-scrape complete",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
