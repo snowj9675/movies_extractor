@@ -1,0 +1,77 @@
+name: Scrape Movie Details
+
+on:
+  # Run automatically every 5 hours (picks up where last run left off)
+  schedule:
+    - cron: "0 */5 * * *"
+  # Also allow manual trigger with optional reset
+  workflow_dispatch:
+    inputs:
+      reset_checkpoint:
+        description: "Delete checkpoint and re-scrape everything (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # 5 hours — stays under GH Actions 6-hour hard limit
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 1
+
+      # ── 2. Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      # ── 3. Optional checkpoint reset ────────────────────────────────────────
+      - name: Reset checkpoint (if requested)
+        if: github.event.inputs.reset_checkpoint == 'true'
+        run: |
+          echo "[INFO] Resetting checkpoint"
+          rm -f checkpoint_details.json
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: reset checkpoint [skip ci]"
+
+      # ── 4. Run scraper ──────────────────────────────────────────────────────
+      - name: Run detail scraper
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python scraper_details.py
+
+      # ── 5. Commit progress back to repo ─────────────────────────────────────
+      #    Runs even if scraper crashes (always: true) so progress is never lost
+      - name: Commit progress
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add movies_detailed.json checkpoint_details.json || true
+
+          # Only commit if there are actual changes
+          if git diff --cached --quiet; then
+            echo "[INFO] No changes to commit"
+          else
+            DONE=$(python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("checkpoint_details.json")
+          data = json.loads(p.read_text()) if p.exists() else []
+          print(len(data))
+          PY
+            )
+            git commit -m "scrape: ${DONE} movies detailed [skip ci]"
+            git push
+            echo "[INFO] Pushed ${DONE} completed movies"
+          fi
