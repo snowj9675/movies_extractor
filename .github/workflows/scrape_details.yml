@@ -46,27 +46,18 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage files only if they exist
-          [ -f movies_detailed.json ]   && git add movies_detailed.json
+          [ -f movies_detailed.json ]    && git add movies_detailed.json
           [ -f checkpoint_details.json ] && git add checkpoint_details.json
 
           if git diff --cached --quiet; then
             echo "[INFO] No changes to commit"
           else
-            DONE=$(python3 -c "
-import json, pathlib
-p = pathlib.Path('checkpoint_details.json')
-data = json.loads(p.read_text()) if p.exists() else []
-print(len(data))
-")
+            DONE=$(python3 -c "import json,pathlib; p=pathlib.Path('checkpoint_details.json'); print(len(json.loads(p.read_text())) if p.exists() else 0)")
             git commit -m "scrape: ${DONE} movies detailed [skip ci]"
-
-            # Retry push up to 3 times in case of race with another run
             for i in 1 2 3; do
               git pull --rebase origin main && git push && break
               echo "[WARN] Push attempt $i failed, retrying..."
               sleep 5
             done
-
             echo "[INFO] Pushed. Checkpoint: ${DONE}"
           fi
