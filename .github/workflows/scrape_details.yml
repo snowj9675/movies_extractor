@@ -40,7 +40,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
           GH_PAT: ${{ secrets.PAT_TOKEN }}
-        run: python scraper_v7.py
+        run: python scraper_details.py
 
       - name: Upload to Neon
         if: always()
