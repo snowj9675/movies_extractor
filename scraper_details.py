@@ -1,45 +1,18 @@
 """
-moviehdtv.com / moviedbhub.com — detail scraper (v6)
+moviehdtv.com / moviedbhub.com — detail scraper (v7)
 ------------------------------------------------------
-Changes from v5:
-  - sanitize_text() applied to ALL scraped string fields (prevents raw text
-    injection that caused "honest government officer..." JSON corruption)
-  - Per-record json.dumps() validation in process() before writing to result_map
-  - save_json() uses ensure_ascii=True (escapes all non-ASCII as \\uXXXX)
-  - Unicode NFC normalization + control-char stripping in sanitize_text()
-  - sanitize_text() applied to download label, quality_group, and all info fields
-  - download append() now sanitizes url and label before storing
-  - synopsis, categories, cast, and all free-text fields go through sanitizer
-
-Keyword-targeted parsing strategy:
-  The site has TWO info block formats depending on page type:
-
-  FORMAT A — Movies (uses <strong> tags):
-    <strong>Movie Name:</strong> Pushpa 2
-    <strong>Release Year:</strong> 2024
-
-  FORMAT B — Series (uses <b> tags, plain text pattern):
-    <b>Web-Series Name</b>: Vikram on Duty
-    <b>Release Year:</b> 2026
-    OR rendered as plain paragraph text:
-    **Web-Series Name**: Vikram on Duty
-
-  Download block also varies:
-  STYLE A — .download-links-div wrapper:
-    <div class="download-links-div">
-      <h3><span>720p</span></h3>
-      <h3><a href="...">Download</a></h3>
-
-  STYLE B — bare h3 sequence (series pages):
-    <h3>480p</h3>
-    <h3><a href="...">⚡Click Here To Download⚡</a></h3>
-    <h3>720p</h3>
-    <h3><a href="...">⚡Click Here To Download⚡</a></h3>
-
-  Both moviehdtv.com and moviedbhub.com use the same template.
+Changes from v6:
+  - Output is CSV instead of JSON — eliminates all JSON corruption issues
+  - Two CSV files per chunk: movies_NNN.csv + downloads_NNN.csv
+  - CHUNK_SIZE = 2000 hrefs per chunk pair
+  - Checkpoint is a plain text file (one scraped ID per line)
+  - Merge step at end produces movies_all.csv + downloads_all.csv
+  - Arrays (genres, cast, screenshots, categories) stored pipe-separated (|)
+  - All text fields go through sanitize_csv() — strips newlines, tabs, quotes
+  - No JSON encoding/decoding anywhere in the hot path
 """
 
-import json
+import csv
 import os
 import re
 import random
@@ -56,19 +29,32 @@ from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MOVIES_JSON_URL = "https://github.com/snowj9675/movies_extractor/raw/refs/heads/main/movies.json"
-OUTPUT_FILE     = "movies_detailed.json"
-CHECKPOINT_FILE = "checkpoint_details.json"
-RESCRAPE_FILE   = "needs_rescrape.json"
+OUTPUT_DIR      = "csv_chunks"          # folder for chunk files
+CHECKPOINT_FILE = "checkpoint_details.txt"   # one scraped ID per line
+RESCRAPE_FILE   = "needs_rescrape.json"      # optional targeted re-scrape list
 
+CHUNK_SIZE      = 2000    # hrefs per chunk pair (movies + downloads CSV)
 MAX_WORKERS     = 10
-SAVE_EVERY      = 25
+SAVE_EVERY      = 50      # flush to CSV every N records
 REQUEST_DELAY   = (0.5, 1.5)
 MAX_RETRIES     = 3
 TIMEOUT         = 20
 TIME_LIMIT_SECS = 17700   # 295 min for GitHub Actions
 
-# Keyword map: every possible label → unified field name
-# Covers both <strong> and <b> variants, with/without colon
+# ── CSV column definitions ────────────────────────────────────────────────────
+MOVIE_COLS = [
+    "id", "href", "title", "cover_image", "date_posted", "page",
+    "content_type", "movie_name", "release_year", "format", "size",
+    "original_lang", "quality", "genres", "cast", "imdb_rating",
+    "season", "episodes", "synopsis", "categories", "screenshots",
+    "watch_online", "scraped_at", "detail_error",
+]
+
+DOWNLOAD_COLS = [
+    "movie_id", "quality_group", "resolution", "size", "label", "url",
+]
+
+# ── Keyword / regex constants (unchanged from v6) ─────────────────────────────
 INFO_KEYWORD_MAP = {
     "movie name":        "movie_name",
     "web-series name":   "movie_name",
@@ -87,13 +73,12 @@ INFO_KEYWORD_MAP = {
     "imdb rating":       "imdb_rating",
 }
 
-# Quality resolution keywords used to identify h3 headings in STYLE B
 QUALITY_KEYWORDS = re.compile(
     r"\b(4k|2160p|1080p|720p|480p|360p|240p|hdtc|hdrip|webrip|web-dl|bdrip|dvdrip|hevc|x264|x265)\b",
     re.IGNORECASE,
 )
 
-SKIP_IMG_WORDS  = {"logo", "favicon", "emoji", "avatar", "banner", "templates"}
+SKIP_IMG_WORDS = {"logo", "favicon", "emoji", "avatar", "banner", "templates"}
 KNOWN_CDN_HOSTS = {
     "nexdrive", "gdrive", "drive.google", "mega.nz", "mediafire",
     "pixeldrain", "1fichier", "gofile", "buzzheavier", "hubcloud",
@@ -114,36 +99,41 @@ _stop_flag  = threading.Event()
 _local      = threading.local()
 
 
-# ── Text sanitizer (prevents JSON injection from raw scraped text) ─────────────
+# ── Text sanitizers ───────────────────────────────────────────────────────────
 
-def sanitize_text(value) -> str:
+def sanitize_csv(value) -> str:
     """
-    Cleans a scraped string so it is always safe to embed in JSON:
+    Makes any value safe for CSV storage:
       - Coerces to str
-      - Strips null bytes and non-printable control chars (keeps \\t \\n \\r)
-      - Normalizes unicode to NFC (avoids ambiguous multi-byte sequences)
-      - Collapses all internal whitespace runs to a single space
+      - NFC unicode normalization
+      - Strips null bytes and control chars (keeps space)
+      - Collapses all whitespace (newlines, tabs) to a single space
       - Strips leading/trailing whitespace
-    This prevents raw synopsis/label text from bleeding across JSON field
-    boundaries (as seen with the "honest government officer..." corruption).
+    CSV quoting handles commas/quotes — we just kill newlines/tabs
+    that would break row boundaries.
     """
+    if value is None:
+        return ""
     if not isinstance(value, str):
-        value = str(value) if value is not None else ""
-    # NFC normalization — resolves ambiguous Unicode lookalike characters
+        value = str(value)
     value = unicodedata.normalize("NFC", value)
-    # Remove null bytes and C0/C1 control chars except tab(9), LF(10), CR(13)
-    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]", "", value)
-    # Collapse all whitespace (including newlines inside a field) to one space
-    value = re.sub(r"[ \t\r\n]+", " ", value).strip()
+    # Remove ALL control chars including \n \r \t — CSV rows must be single-line
+    value = re.sub(r"[\x00-\x1f\x7f\x80-\x9f]", " ", value)
+    value = re.sub(r" +", " ", value).strip()
     return value
 
 
 def sanitize_url(value) -> str:
-    """Minimal URL sanitizer — strip whitespace and control chars only."""
     if not isinstance(value, str):
         return ""
-    value = re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
-    return value
+    return re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
+
+
+def pipe_join(lst) -> str:
+    """Join a list into a pipe-separated string for CSV storage."""
+    if not lst:
+        return ""
+    return "|".join(sanitize_csv(str(x)) for x in lst if x)
 
 
 # ── Session / IO helpers ──────────────────────────────────────────────────────
@@ -156,27 +146,56 @@ def get_session():
     return _local.session
 
 
-def load_json(path, default):
+def load_checkpoint() -> set:
+    p = Path(CHECKPOINT_FILE)
+    if p.exists():
+        return set(p.read_text(encoding="utf-8").splitlines())
+    return set()
+
+
+def append_checkpoint(movie_id: str):
+    with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
+        f.write(movie_id + "\n")
+
+
+def chunk_path(chunk_num: int, kind: str) -> Path:
+    """Returns e.g. csv_chunks/movies_001.csv"""
+    Path(OUTPUT_DIR).mkdir(exist_ok=True)
+    return Path(OUTPUT_DIR) / f"{kind}_{chunk_num:03d}.csv"
+
+
+def open_csv_writers(chunk_num: int):
+    """Open (append) CSV writers for movies + downloads chunk."""
+    mp = chunk_path(chunk_num, "movies")
+    dp = chunk_path(chunk_num, "downloads")
+
+    write_movie_header    = not mp.exists()
+    write_download_header = not dp.exists()
+
+    mf = open(mp, "a", encoding="utf-8", newline="")
+    df = open(dp, "a", encoding="utf-8", newline="")
+
+    mw = csv.DictWriter(mf, fieldnames=MOVIE_COLS, extrasaction="ignore")
+    dw = csv.DictWriter(df, fieldnames=DOWNLOAD_COLS, extrasaction="ignore")
+
+    if write_movie_header:
+        mw.writeheader()
+    if write_download_header:
+        dw.writeheader()
+
+    return mf, df, mw, dw
+
+
+def load_json_file(path, default):
+    import json
     p = Path(path)
     if p.exists() and p.stat().st_size > 2:
         try:
             with open(p, encoding="utf-8") as f:
                 return json.load(f)
-        except json.JSONDecodeError:
-            print(f"[WARN] {path} corrupt — starting fresh", flush=True)
+        except Exception:
+            print(f"[WARN] {path} unreadable", flush=True)
     return default
-
-
-def save_json(path, data):
-    """
-    Saves JSON with ensure_ascii=True so every non-ASCII character is stored
-    as a \\uXXXX escape sequence, guaranteeing a pure ASCII-safe JSON file and
-    eliminating 'ambiguous unicode character' warnings from validators.
-    """
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=True, indent=2)
-    os.replace(tmp, path)
 
 
 def slug(url):
@@ -202,8 +221,9 @@ def fmt_time(secs):
 
 
 def fetch_movies_list():
+    import json
     print("[INFO] Fetching movies list …", flush=True)
-    pat = os.environ.get("GH_PAT", "")
+    pat  = os.environ.get("GH_PAT", "")
     hdrs = {**HEADERS, **({"Authorization": f"Bearer {pat}"} if pat else {})}
     for attempt in range(1, 4):
         try:
@@ -215,7 +235,7 @@ def fetch_movies_list():
         except Exception as e:
             print(f"[WARN] Attempt {attempt}/3: {e}", flush=True)
             time.sleep(5)
-    return load_json("movies.json", [])
+    return load_json_file("movies.json", [])
 
 
 def fetch(url):
@@ -228,28 +248,22 @@ def fetch(url):
             r = session.get(url, timeout=TIMEOUT)
             r.raise_for_status()
             return r.text
-        except requests.RequestException as e:
+        except requests.RequestException:
             if attempt == MAX_RETRIES: return None
             time.sleep(2 ** attempt)
 
 
-# ── Core keyword-targeted info parser ────────────────────────────────────────
+# ── Info parser (unchanged logic, sanitize_csv instead of sanitize_text) ──────
 
 def extract_info(soup) -> dict:
-    """
-    Tries both FORMAT A (<strong>) and FORMAT B (<b> / plain text).
-    Returns a flat dict keyed by our unified field names.
-    All values are passed through sanitize_text() before storage.
-    """
     info = {}
 
     def store(raw_key, raw_value):
-        key   = sanitize_text(raw_key).lower().rstrip(":")
+        key   = sanitize_csv(raw_key).lower().rstrip(":")
         field = INFO_KEYWORD_MAP.get(key)
         if field and raw_value and field not in info:
-            info[field] = sanitize_text(raw_value)
+            info[field] = sanitize_csv(raw_value)
 
-    # FORMAT A — <strong>Key:</strong> value as next sibling
     for tag in soup.find_all("strong"):
         raw_key = tag.get_text(strip=True).rstrip(":")
         sib = tag.next_sibling
@@ -257,7 +271,6 @@ def extract_info(soup) -> dict:
             val = (sib if isinstance(sib, str) else sib.get_text()).strip()
             store(raw_key, val)
 
-    # FORMAT B — <b>Key</b>: value as next sibling
     for tag in soup.find_all("b"):
         raw_key = tag.get_text(strip=True).rstrip(":")
         sib = tag.next_sibling
@@ -266,8 +279,6 @@ def extract_info(soup) -> dict:
             val = val.lstrip(":").strip()
             store(raw_key, val)
 
-    # FORMAT B fallback — parse full paragraph text as "Key: Value" lines
-    # Covers cases where bold is rendered as literal **text** or CSS bold
     if "movie_name" not in info:
         for p in soup.find_all(["p", "li"]):
             text = p.get_text(separator="\n")
@@ -280,31 +291,26 @@ def extract_info(soup) -> dict:
     return info
 
 
-# ── Download link parser ──────────────────────────────────────────────────────
+# ── Download parser ───────────────────────────────────────────────────────────
 
 def extract_downloads(soup) -> list:
-    downloads  = []
+    downloads = []
     seen_urls: set = set()
 
     def append(quality_group, a_tag):
         url = sanitize_url(a_tag.get("href", ""))
         if not url or url in seen_urls or url.startswith("#"):
             return
-        # Only keep actual download links, not internal nav links
         if not any(cdn in url for cdn in KNOWN_CDN_HOSTS):
             if url.startswith("http") and \
                "moviehdtv.com" not in url and "moviedbhub.com" not in url:
-                pass  # external = likely a download
+                pass
             else:
                 return
         seen_urls.add(url)
 
-        # Sanitize label — this is the field that caused the v5 corruption:
-        # a_tag spanning multiple DOM nodes could return huge text blobs
-        label = sanitize_text(a_tag.get_text(" ", strip=True))
-
-        # Sanitize quality_group too (comes from h3 text)
-        q_group = sanitize_text(quality_group) if quality_group else None
+        label   = sanitize_csv(a_tag.get_text(" ", strip=True))
+        q_group = sanitize_csv(quality_group) if quality_group else ""
 
         res = (re.search(r"\b(4[Kk]|2160p|1080p|720p|480p|360p|240p)\b", label)
                or [None, None])[1]
@@ -313,13 +319,12 @@ def extract_downloads(soup) -> list:
 
         downloads.append({
             "quality_group": q_group,
-            "resolution":    res,
-            "size":          sz.replace(" ", "") if sz else None,
+            "resolution":    res or "",
+            "size":          sz.replace(" ", "") if sz else "",
             "label":         label,
             "url":           url,
         })
 
-    # STYLE A — .download-links-div
     dl_div = soup.select_one(".download-links-div")
     if dl_div:
         current_q = None
@@ -328,17 +333,15 @@ def extract_downloads(soup) -> list:
                 span = tag.find("span")
                 a    = tag.find("a")
                 if span and not a:
-                    current_q = sanitize_text(span.get_text(strip=True))
+                    current_q = sanitize_csv(span.get_text(strip=True))
                 elif a:
                     append(current_q, a)
                 elif QUALITY_KEYWORDS.search(tag.get_text()):
-                    current_q = sanitize_text(tag.get_text(strip=True))
+                    current_q = sanitize_csv(tag.get_text(strip=True))
             else:
                 for a in tag.find_all("a", href=True):
                     append(current_q, a)
 
-    # STYLE B — bare <h3> sequence: quality heading then <h3><a> link
-    # Only use if STYLE A found nothing
     if not downloads:
         current_q = None
         for tag in soup.find_all("h3"):
@@ -347,9 +350,8 @@ def extract_downloads(soup) -> list:
             if a:
                 append(current_q, a)
             elif QUALITY_KEYWORDS.search(text):
-                current_q = sanitize_text(text)
+                current_q = sanitize_csv(text)
 
-    # STYLE C — last resort: any external <a> pointing to CDN
     if not downloads:
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -363,15 +365,12 @@ def extract_downloads(soup) -> list:
 
 def parse(html, base) -> dict:
     soup = BeautifulSoup(html, "html.parser")
-
     info = extract_info(soup)
 
-    # content type
     content_type = "series" if any(
         k in info for k in ["season", "episodes"]
     ) or "season" in base.get("href", "").lower() else "movie"
 
-    # synopsis — sanitized to prevent multi-paragraph bleed into the field
     synopsis = ""
     h3 = soup.find(
         lambda t: t.name == "h3" and t.get_text() and
@@ -380,9 +379,8 @@ def parse(html, base) -> dict:
     if h3:
         p = h3.find_next("p")
         if p:
-            synopsis = sanitize_text(p.get_text(strip=True))
+            synopsis = sanitize_csv(p.get_text(strip=True))
 
-    # screenshots — images below the cover in article body
     cover       = base.get("image", "")
     screenshots = []
     for img in soup.find_all("img"):
@@ -393,11 +391,9 @@ def parse(html, base) -> dict:
             if src not in screenshots:
                 screenshots.append(sanitize_url(src))
 
-    # downloads
     downloads = extract_downloads(soup)
 
-    # watch online
-    watch_online = None
+    watch_online = ""
     for sel in [
         "#IndStreamPlayer iframe", ".stream-player iframe",
         ".online-player iframe", "iframe[src*='player']",
@@ -410,27 +406,24 @@ def parse(html, base) -> dict:
                 watch_online = sanitize_url(raw_src)
                 break
 
-    # categories — internal nav links in article paragraphs
     categories = []
     for p in soup.select("article p, .post-content p, div.full-text p"):
         for a in p.find_all("a", href=True):
             href_a = a["href"]
-            t      = sanitize_text(a.get_text(strip=True))
+            t      = sanitize_csv(a.get_text(strip=True))
             if not t or t in {"HdMovieHub", "HdMovieHub.You"}: continue
             if "moviehdtv.com" in href_a or "moviedbhub.com" in href_a:
                 if t not in categories:
                     categories.append(t)
         if categories: break
 
-    # genres — split from info
     genres_raw = info.get("genres", "")
     genres = [
-        sanitize_text(g)
+        sanitize_csv(g)
         for g in re.split(r"[,/|]", genres_raw)
         if g.strip()
     ]
 
-    # quality fallback from downloads
     quality = info.get("quality", "")
     if not quality and downloads:
         qs = [d["resolution"] for d in downloads if d.get("resolution")]
@@ -441,108 +434,153 @@ def parse(html, base) -> dict:
                        reverse=True)
             )
 
-    # title
-    real_title = sanitize_text(base.get("title", ""))
+    real_title = sanitize_csv(base.get("title", ""))
     h1 = soup.select_one("h1.post-title, h1.entry-title, article h1, h1")
     if h1:
-        real_title = sanitize_text(h1.get_text(strip=True))
+        real_title = sanitize_csv(h1.get_text(strip=True))
     if not real_title:
         og = soup.find("meta", property="og:title")
         if og:
-            real_title = sanitize_text(
+            real_title = sanitize_csv(
                 og.get("content", "").replace(" - HdMovieHub", "").strip()
             )
 
-    # cover
     real_cover = sanitize_url(base.get("image", ""))
     if not real_cover:
         og_img = soup.find("meta", property="og:image")
         if og_img:
             real_cover = sanitize_url(og_img.get("content", "").strip())
 
-    # date
-    real_date = sanitize_text(base.get("date", ""))
+    real_date = sanitize_csv(base.get("date", ""))
     if not real_date:
         t = soup.select_one("time, .date-time span, .post-date")
         if t:
-            real_date = sanitize_text(
+            real_date = sanitize_csv(
                 t.get("datetime") or t.get_text(strip=True)
             )
 
-    return {
-        "id":            slug(base["href"]),
+    movie_id = slug(base["href"])
+
+    # Flat movie row — arrays stored as pipe-separated strings
+    movie_row = {
+        "id":            movie_id,
         "href":          sanitize_url(base["href"]),
         "title":         real_title,
         "cover_image":   real_cover,
         "date_posted":   real_date,
-        "page":          base.get("page"),
+        "page":          str(base.get("page", "")),
         "content_type":  content_type,
         "movie_name":    info.get("movie_name", ""),
         "release_year":  info.get("release_year", ""),
         "format":        info.get("format", ""),
         "size":          info.get("size", ""),
         "original_lang": info.get("original_lang", ""),
-        "quality":       quality,
-        "genres":        genres,
-        "cast":          info.get("cast", ""),
-        "imdb_rating":   info.get("imdb_rating", ""),
-        "season":        info.get("season", ""),
-        "episodes":      info.get("episodes", ""),
+        "quality":       sanitize_csv(quality),
+        "genres":        pipe_join(genres),
+        "cast":          sanitize_csv(info.get("cast", "")),
+        "imdb_rating":   sanitize_csv(info.get("imdb_rating", "")),
+        "season":        sanitize_csv(info.get("season", "")),
+        "episodes":      sanitize_csv(info.get("episodes", "")),
         "synopsis":      synopsis,
-        "categories":    categories,
-        "screenshots":   screenshots,
+        "categories":    pipe_join(categories),
+        "screenshots":   pipe_join(screenshots),
         "watch_online":  watch_online,
-        "downloads":     downloads,
         "scraped_at":    datetime.now(timezone.utc).isoformat(),
-        "detail_error":  None,
+        "detail_error":  "",
     }
+
+    # Download rows — one per link
+    download_rows = [
+        {
+            "movie_id":      movie_id,
+            "quality_group": d["quality_group"],
+            "resolution":    d["resolution"],
+            "size":          d["size"],
+            "label":         d["label"],
+            "url":           d["url"],
+        }
+        for d in downloads
+    ]
+
+    return movie_row, download_rows
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 
-def process(base) -> dict:
+def process(base):
     movie_id = slug(base["href"])
 
     if _stop_flag.is_set():
         return {
-            **base, "id": movie_id,
+            "id": movie_id, "href": sanitize_url(base["href"]),
+            "title": "", "cover_image": "", "date_posted": "",
+            "page": str(base.get("page", "")), "content_type": "",
+            "movie_name": "", "release_year": "", "format": "",
+            "size": "", "original_lang": "", "quality": "",
+            "genres": "", "cast": "", "imdb_rating": "",
+            "season": "", "episodes": "", "synopsis": "",
+            "categories": "", "screenshots": "", "watch_online": "",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
             "detail_error": "skipped_time_limit",
-        }
+        }, []
 
     html = fetch(base["href"])
     if html is None:
         err = "fetch_failed" if not _stop_flag.is_set() else "skipped_time_limit"
         return {
-            **base, "id": movie_id,
+            "id": movie_id, "href": sanitize_url(base["href"]),
+            "title": "", "cover_image": "", "date_posted": "",
+            "page": str(base.get("page", "")), "content_type": "",
+            "movie_name": "", "release_year": "", "format": "",
+            "size": "", "original_lang": "", "quality": "",
+            "genres": "", "cast": "", "imdb_rating": "",
+            "season": "", "episodes": "", "synopsis": "",
+            "categories": "", "screenshots": "", "watch_online": "",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
             "detail_error": err,
-        }
+        }, []
 
     try:
-        result = parse(html, base)
-
-        # ── Per-record JSON validation ─────────────────────────────────────
-        # Attempt to serialize the record NOW, before it enters result_map.
-        # Any field that would corrupt the output file raises here instead,
-        # so the bad record is logged with detail_error and skipped cleanly.
-        try:
-            json.dumps(result, ensure_ascii=True)
-        except (ValueError, TypeError) as json_err:
-            return {
-                **base, "id": movie_id,
-                "scraped_at": datetime.now(timezone.utc).isoformat(),
-                "detail_error": f"json_invalid: {json_err}",
-            }
-
-        return result
-
+        movie_row, download_rows = parse(html, base)
+        return movie_row, download_rows
     except Exception as e:
         return {
-            **base, "id": movie_id,
+            "id": movie_id, "href": sanitize_url(base["href"]),
+            "title": "", "cover_image": "", "date_posted": "",
+            "page": str(base.get("page", "")), "content_type": "",
+            "movie_name": "", "release_year": "", "format": "",
+            "size": "", "original_lang": "", "quality": "",
+            "genres": "", "cast": "", "imdb_rating": "",
+            "season": "", "episodes": "", "synopsis": "",
+            "categories": "", "screenshots": "", "watch_online": "",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
-            "detail_error": f"parse_error: {e}",
-        }
+            "detail_error": f"parse_error: {sanitize_csv(str(e))}",
+        }, []
+
+
+# ── Merge helper ──────────────────────────────────────────────────────────────
+
+def merge_chunks():
+    """Merge all chunk CSVs into movies_all.csv and downloads_all.csv."""
+    out_dir = Path(OUTPUT_DIR)
+    for kind, cols in [("movies", MOVIE_COLS), ("downloads", DOWNLOAD_COLS)]:
+        out_path = out_dir / f"{kind}_all.csv"
+        seen_ids: set = set()
+        count = 0
+        with open(out_path, "w", encoding="utf-8", newline="") as out_f:
+            writer = csv.DictWriter(out_f, fieldnames=cols)
+            writer.writeheader()
+            for chunk_file in sorted(out_dir.glob(f"{kind}_[0-9]*.csv")):
+                with open(chunk_file, encoding="utf-8", newline="") as in_f:
+                    reader = csv.DictReader(in_f)
+                    for row in reader:
+                        dedup_key = row.get("id") if kind == "movies" else row.get("url")
+                        if dedup_key and dedup_key in seen_ids:
+                            continue
+                        seen_ids.add(dedup_key)
+                        writer.writerow(row)
+                        count += 1
+        print(f"[MERGE] {out_path}  →  {count:,} rows", flush=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -551,49 +589,75 @@ def main():
     global _start_time
     _start_time = time.monotonic()
 
-    existing   = load_json(OUTPUT_FILE, [])
-    result_map = {r["id"]: r for r in existing if "id" in r}
+    Path(OUTPUT_DIR).mkdir(exist_ok=True)
 
-    rescrape_list = load_json(RESCRAPE_FILE, None)
+    done_ids = load_checkpoint()
+
+    rescrape_list = load_json_file(RESCRAPE_FILE, None)
 
     if rescrape_list is not None:
-        print(
-            f"[INFO] TARGETED MODE — {len(rescrape_list)} URLs from {RESCRAPE_FILE}",
-            flush=True,
-        )
-        todo = [
-            {
-                "href":  m["href"],
-                "title": result_map.get(slug(m["href"]), {}).get("title", ""),
-                "image": result_map.get(slug(m["href"]), {}).get("cover_image", ""),
-                "date":  result_map.get(slug(m["href"]), {}).get("date_posted", ""),
-                "page":  result_map.get(slug(m["href"]), {}).get("page", 0),
-            }
-            for m in rescrape_list
-        ]
-        done_ids = set()  # always re-scrape all listed
+        print(f"[INFO] TARGETED MODE — {len(rescrape_list)} URLs", flush=True)
+        todo     = [m for m in rescrape_list]
+        done_ids = set()  # re-scrape all listed
     else:
-        movies   = fetch_movies_list()
-        cp_ids   = load_json(CHECKPOINT_FILE, [])
-        done_ids = set(cp_ids) | set(result_map.keys())
-        todo     = [m for m in movies if slug(m["href"]) not in done_ids]
+        movies = fetch_movies_list()
+        todo   = [m for m in movies if slug(m["href"]) not in done_ids]
 
     total = len(todo)
-    print(f"[INFO] To scrape:   {total}",         flush=True)
-    print(f"[INFO] In output:   {len(result_map)}", flush=True)
-    print(f"[INFO] Time limit:  {fmt_time(TIME_LIMIT_SECS)}", flush=True)
+    print(f"[INFO] To scrape:    {total}",          flush=True)
+    print(f"[INFO] Already done: {len(done_ids)}",  flush=True)
+    print(f"[INFO] Chunk size:   {CHUNK_SIZE}",     flush=True)
+    print(f"[INFO] Time limit:   {fmt_time(TIME_LIMIT_SECS)}", flush=True)
 
     if not todo:
-        print("[INFO] Nothing to do.", flush=True)
+        print("[INFO] Nothing to do — merging existing chunks.", flush=True)
+        merge_chunks()
         return
 
-    completed = errors = skipped = 0
-    save_lock = threading.Lock()
-    pending   = [0]
+    # Figure out which chunk number to start from
+    existing_chunks = sorted(Path(OUTPUT_DIR).glob("movies_[0-9]*.csv"))
+    if existing_chunks:
+        last_num = int(existing_chunks[-1].stem.split("_")[-1])
+        # Count rows in last chunk (minus header)
+        with open(existing_chunks[-1], encoding="utf-8") as f:
+            last_chunk_rows = sum(1 for _ in f) - 1
+        if last_chunk_rows < CHUNK_SIZE:
+            current_chunk = last_num
+            chunk_count   = last_chunk_rows
+        else:
+            current_chunk = last_num + 1
+            chunk_count   = 0
+    else:
+        current_chunk = 1
+        chunk_count   = 0
 
-    def do_save():
-        save_json(OUTPUT_FILE,     list(result_map.values()))
-        save_json(CHECKPOINT_FILE, list(done_ids))
+    save_lock    = threading.Lock()
+    pending_rows = []   # [(movie_row, [download_rows])]
+    completed = errors = skipped = 0
+    total_written = 0
+
+    def flush_to_csv(rows):
+        nonlocal current_chunk, chunk_count, total_written
+        mf, df, mw, dw = open_csv_writers(current_chunk)
+        try:
+            for movie_row, download_rows in rows:
+                mw.writerow(movie_row)
+                chunk_count += 1
+                total_written += 1
+                for dr in download_rows:
+                    dw.writerow(dr)
+                if chunk_count >= CHUNK_SIZE:
+                    mf.close(); df.close()
+                    print(
+                        f"\n[CHUNK] Closed chunk {current_chunk:03d} "
+                        f"({CHUNK_SIZE} movies)", flush=True
+                    )
+                    current_chunk += 1
+                    chunk_count    = 0
+                    mf, df, mw, dw = open_csv_writers(current_chunk)
+        finally:
+            mf.close()
+            df.close()
 
     def watcher():
         while not _stop_flag.is_set():
@@ -614,61 +678,77 @@ def main():
         futures = {pool.submit(process, m): m for m in todo}
         for future in as_completed(futures):
             try:
-                detail = future.result()
+                movie_row, download_rows = future.result()
             except Exception as exc:
-                base   = futures[future]
-                detail = {
-                    **base,
-                    "id":          slug(base["href"]),
-                    "scraped_at":  datetime.now(timezone.utc).isoformat(),
-                    "detail_error": f"exception: {exc}",
+                base     = futures[future]
+                movie_id = slug(base["href"])
+                movie_row = {
+                    "id": movie_id, "href": sanitize_url(base["href"]),
+                    "title": "", "cover_image": "", "date_posted": "",
+                    "page": str(base.get("page", "")), "content_type": "",
+                    "movie_name": "", "release_year": "", "format": "",
+                    "size": "", "original_lang": "", "quality": "",
+                    "genres": "", "cast": "", "imdb_rating": "",
+                    "season": "", "episodes": "", "synopsis": "",
+                    "categories": "", "screenshots": "", "watch_online": "",
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "detail_error": f"exception: {sanitize_csv(str(exc))}",
                 }
+                download_rows = []
 
-            movie_id = detail.get("id", "")
-            err      = detail.get("detail_error")
+            movie_id = movie_row["id"]
+            err      = movie_row.get("detail_error", "")
 
             with save_lock:
-                result_map[movie_id] = detail
                 done_ids.add(movie_id)
+                append_checkpoint(movie_id)
+
                 if not err:
                     completed += 1
-                elif "skipped" in (err or ""):
+                elif "skipped" in err:
                     skipped   += 1
                 else:
                     errors    += 1
-                pending[0] += 1
-                if pending[0] >= SAVE_EVERY:
-                    do_save()
-                    pending[0] = 0
+
+                pending_rows.append((movie_row, download_rows))
+
+                if len(pending_rows) >= SAVE_EVERY:
+                    flush_to_csv(pending_rows)
+                    pending_rows.clear()
+
                 total_done = completed + errors + skipped
                 if total_done % LOG_EVERY == 0 or total_done == total:
                     pct = total_done / total * 100
                     print(
                         f"[{fmt_time(elapsed())}] {total_done}/{total} ({pct:.1f}%)  "
                         f"ok={completed} err={errors} skip={skipped} "
-                        f"out={len(result_map)}",
+                        f"written={total_written}",
                         flush=True,
                     )
 
             if _stop_flag.is_set() and skipped > 0:
                 break
 
+    # Flush any remaining
     with save_lock:
-        do_save()
+        if pending_rows:
+            flush_to_csv(pending_rows)
+            pending_rows.clear()
 
     _stop_flag.set()
     print(
-        f"\n[DONE] {fmt_time(elapsed())}  ok={completed} err={errors} skip={skipped}",
+        f"\n[DONE] {fmt_time(elapsed())}  "
+        f"ok={completed} err={errors} skip={skipped}  "
+        f"written={total_written}",
         flush=True,
     )
-    print(f"       Total in output: {len(result_map)}", flush=True)
+
+    print("\n[MERGE] Merging all chunks …", flush=True)
+    merge_chunks()
 
     if rescrape_list is not None and skipped == 0:
         Path(RESCRAPE_FILE).unlink(missing_ok=True)
-        print(
-            f"[INFO] Removed {RESCRAPE_FILE} — targeted re-scrape complete",
-            flush=True,
-        )
+        print(f"[INFO] Removed {RESCRAPE_FILE}", flush=True)
 
 
 if __name__ == "__main__":
