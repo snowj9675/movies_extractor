@@ -28,31 +28,44 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4 lxml psycopg2-binary
 
       - name: Reset checkpoint (if requested)
         if: github.event.inputs.reset_checkpoint == 'true'
-        run: rm -f checkpoint_details.json movies_detailed.json
+        run: |
+          rm -f checkpoint_details.txt
+          rm -rf csv_chunks/
 
       - name: Run detail scraper
         env:
           PYTHONUNBUFFERED: "1"
           GH_PAT: ${{ secrets.PAT_TOKEN }}
-        run: python scraper_details.py
+        run: python scraper_v7.py
 
-      - name: Commit progress
+      - name: Upload to Neon
+        if: always()
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ -f csv_chunks/movies_all.csv ]; then
+            python upload_to_neon.py
+          else
+            echo "[INFO] No merged CSV found — skipping Neon upload"
+          fi
+
+      - name: Commit checkpoint and CSVs
         if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          [ -f movies_detailed.json ]    && git add movies_detailed.json
-          [ -f checkpoint_details.json ] && git add checkpoint_details.json
+          [ -f checkpoint_details.txt ] && git add checkpoint_details.txt
+          [ -d csv_chunks ]             && git add csv_chunks/
 
           if git diff --cached --quiet; then
             echo "[INFO] No changes to commit"
           else
-            DONE=$(python3 -c "import json,pathlib; p=pathlib.Path('checkpoint_details.json'); print(len(json.loads(p.read_text())) if p.exists() else 0)")
+            DONE=$(wc -l < checkpoint_details.txt 2>/dev/null | tr -d ' ' || echo 0)
             git commit -m "scrape: ${DONE} movies detailed [skip ci]"
             for i in 1 2 3; do
               git pull --rebase origin main && git push && break
